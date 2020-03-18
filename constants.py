@@ -26,8 +26,3 @@ NADIR_1KM = (548, 52)
 OBLIQUE_1KM = (50, -50)
 
 BORDER_OFFSET = 20
-
-# A truely random seed
-RANDOM_SEED = 42
-
-

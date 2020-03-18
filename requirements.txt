@@ -1,6 +1,5 @@
 numpy
 scipy
-pillow
-matplotlib
 xarray
+h5netcdf
 pytest

@@ -1,17 +1,19 @@
 import os
 import numpy as np
 import xarray as xr
-import threading
-from PIL import Image
-import matplotlib.pyplot as plt
 from scipy.interpolate import RectBivariateSpline
 
-from src import constants
-
-
 class Regrid:
+    """ Class to perform regriding between different resolutions
+    """
 
     def __init__(self, grid_a, grid_b):
+        """Create a regridding object
+
+        Args:
+            grid_a: dataset in the resolution to regrid to
+            grid_b: dataset in the resolution to regrid from.
+        """
         if grid_a.start_offset == grid_b.start_offset:
             start_offset = 0.0
         else:
@@ -34,75 +36,33 @@ class Regrid:
         return (('rows', 'columns'), values)
 
     def __call__(self, dataset):
+        """Regrid `dataset` to the resolution defined by this object"""
         channels = {}
         for name in dataset:
             channels[name] = self.regrid_channel(dataset[name])
 
         return xr.Dataset(channels)
 
-def resize_product(data, resolution=constants.RESOLUTION_1KM):
-    h, w = resolution
-
-    def downsample(img):
-        if img.dtype == np.float32:
-            mode = 'F'
-        if img.dtype == np.uint8:
-            mode = 'L'
-        if img.dtype == np.int32 or img.dtype == np.int64:
-            mode = 'I'
-
-        img = resize(img, (h, w), mode=mode)
-
-        return img
-
-    channels = {}
-    for channel_name in data:
-        channel = data[channel_name]
-        attrs = channel.attrs.copy()
-
-        if channel.dtype == np.float64:
-            channel = channel.astype(np.float32)
-
-        if channel.dtype == np.uint16:
-            channel = channel.astype(np.int32)
-
-        channels[channel_name] = xr.apply_ufunc(downsample, channel,
-                                                dask='parallelized',
-                                                input_core_dims=[['rows', 'columns']],
-                                                output_core_dims=[['rows', 'columns']],
-                                                output_dtypes=[channel.dtype],
-                                                output_sizes={'columns': w, 'rows': h},
-                                                exclude_dims=set(['rows', 'columns']),
-                                                keep_attrs=True)
-
-        channels[channel_name] = channels[channel_name].assign_attrs(**attrs)
-
-    return xr.Dataset(channels)
-
-
-class threadsafe_iter:
-    """Takes an iterator/generator and makes it thread-safe by
-    serializing call to the `next` method of given iterator/generator.
-    """
-
-    def __init__(self, it):
-        self.it = it
-        self.lock = threading.Lock()
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        with self.lock:
-            return self.it.__next__()
-
 
 class ImageLoader:
+    """Class to load Sentinel-3 SLSTR level 1 product data"""
 
     def __init__(self, path):
+        """Create a new product loader
+
+        Args:
+            path: file location of the product
+        """
         self.path = path
 
     def load_radiances(self, view='an'):
+        """Load the radiance channels
+
+        Data will be returned in the 0.5km grid resolution.
+
+        Args:
+            view: what view to load radiances in e.g. 'an', 'ao' etc.
+        """
         rads = [
             self.load_radiance_channel(
                 self.path,
@@ -110,10 +70,21 @@ class ImageLoader:
                 view) for i in range(
                 1,
                 7)]
+        attrs = rads[0].attrs
         rads = xr.merge(rads)
+        rads.attrs['start_offset'] = attrs['start_offset']
+        rads.attrs['track_offset'] = attrs['track_offset']
+        rads.attrs['resolution'] = attrs['resolution']
         return rads
 
     def load_irradiances(self, view='an'):
+        """Load the irradiances
+
+        Data will be returned in the 0.5km grid resolution.
+
+        Args:
+            view: what view to load radiances in e.g. 'an', 'ao' etc.
+        """
         irradiances = {}
         for i in range(1, 7):
             name = 'S{}_solar_irradiance_{}'.format(i, view)
@@ -125,7 +96,17 @@ class ImageLoader:
         return irradiances
 
 
-    def load_reflectance(self, view='an'):
+    def load_reflectances(self, view='an'):
+        """Load the reflectances
+
+        This will first load the radiances, then convert them to reflectance
+        values using the solar zenith and irradiance.
+
+        Data will be returned in the 0.5km grid resolution.
+
+        Args:
+            view: what view to load reflectances in e.g. 'an', 'ao' etc.
+        """
         refs = [
             self.load_reflectance_channel(
                 self.path,
@@ -133,8 +114,108 @@ class ImageLoader:
                 view) for i in range(
                 1,
                 7)]
+        attrs = refs[0].attrs
         refs = xr.merge(refs)
+        refs.attrs['start_offset'] = attrs['start_offset']
+        refs.attrs['track_offset'] = attrs['track_offset']
+        refs.attrs['resolution'] = attrs['resolution']
         return refs
+
+    def load_bts(self, view='in'):
+        """Load the brightness temperatures
+
+        Data will be returned in the 1km grid resolution.
+
+        Args:
+            view: what view to load brightness temps in e.g. 'in', 'io' etc.
+        """
+        bts = [self.load_bt_channel(self.path, i, view) for i in range(7, 10)]
+        attrs = bts[0].attrs
+        bts = xr.merge(bts)
+        bts.attrs['start_offset'] = attrs['start_offset']
+        bts.attrs['track_offset'] = attrs['track_offset']
+        bts.attrs['resolution'] = attrs['resolution']
+        return bts
+
+    def load_flags(self, view='in'):
+        """Load flags for this product.
+
+        This will include entries such whether the pixels are land, ocean,
+        twilight, day etc.
+
+        Data will be returned in the 1km grid resolution.
+
+        Args:
+            view: what view to load flags in e.g. 'in', 'io' etc.
+        """
+        flags_path = os.path.join(self.path, 'flags_{}.nc'.format(view))
+        excluded = [
+            'confidence_orphan_{}',
+            'pointing_orphan_{}',
+            'pointing_{}',
+            'cloud_orphan_{}',
+            'bayes_orphan_{}',
+            'probability_cloud_dual_{}']
+        excluded = [e.format(view) for e in excluded]
+        flags = xr.open_dataset(flags_path, decode_times=False,
+                                drop_variables=excluded, engine='h5netcdf')
+
+        confidence_var = 'confidence_{}'.format(view)
+        flag_masks = flags[confidence_var].attrs['flag_masks']
+        flag_meanings = flags[confidence_var].attrs['flag_meanings'].split()
+        flag_map = dict(zip(flag_meanings, flag_masks))
+        expanded_flags = {}
+        for key, bit in flag_map.items():
+            msk = flags[confidence_var] & bit
+            msk = xr.where(msk > 0, 1, 0)
+            expanded_flags[key] = msk
+        flags = flags.assign(**expanded_flags)
+        return flags
+
+    def load_geometry(self):
+        """Load geometry information for this product.
+
+        Data will be returned in the 1km grid resolution.
+
+        Args:
+            view: what view to load geometry in e.g. 'in', 'io' etc.
+        """
+        path = os.path.join(self.path, 'geometry_tn.nc')
+        geo = xr.open_dataset(path, decode_times=False, engine='h5netcdf')
+        return geo
+
+    def load_met(self):
+        """Load meterological information for this product.
+
+        Data will be returned in the 1km grid resolution.
+
+        Args:
+            view: what view to load metreological in e.g. 'in', 'io' etc.
+        """
+        met_path = os.path.join(self.path, 'met_tx.nc')
+        met = xr.open_dataset(met_path, decode_times=False, engine='h5netcdf')
+        met = met[['total_column_water_vapour_tx', 'cloud_fraction_tx',
+                   'skin_temperature_tx', 'sea_surface_temperature_tx',
+                   'total_column_ozone_tx', 'soil_wetness_tx',
+                   'snow_albedo_tx', 'snow_depth_tx', 'sea_ice_fraction_tx',
+                   'surface_pressure_tx']]
+        met = met.squeeze()
+        return met
+
+    def load_geodetic(self, view='an'):
+        """Load geodetic information for this product.
+
+        Data will be returned in the 1km grid resolution.
+
+        Args:
+            view: what view to load geodetic in e.g. 'in', 'io' etc.
+        """
+        flags_path = os.path.join(self.path, 'geodetic_{}.nc'.format(view))
+        excluded = ['elevation_orphan_an', 'elevation_an',
+                    'latitude_orphan_an', 'longitude_orphan_an']
+        flags = xr.open_dataset(flags_path, decode_times=False,
+                                drop_variables=excluded, engine='h5netcdf')
+        return flags
 
     def load_reflectance_channel(self, path, channel_num, view='an'):
         rads = self.load_radiance_channel(path, channel_num, view)
@@ -172,10 +253,6 @@ class ImageLoader:
             path, decode_times=False, drop_variables=excluded_vars, engine='h5netcdf')
         return radiance
 
-    def load_bts(self, view='in'):
-        bts = [self.load_bt_channel(self.path, i, view) for i in range(7, 10)]
-        bts = xr.merge(bts)
-        return bts
 
     def load_bt_channel(self, path, channel_num, view='in'):
         excluded_vars = [
@@ -188,168 +265,3 @@ class ImageLoader:
         bt = xr.open_dataset(path, decode_times=False,
                              drop_variables=excluded_vars, engine='h5netcdf')
         return bt
-
-    def load_flags(self, view='in'):
-        flags_path = os.path.join(self.path, 'flags_{}.nc'.format(view))
-        excluded = [
-            'confidence_orphan_{}',
-            'pointing_orphan_{}',
-            'pointing_{}',
-            'cloud_orphan_{}',
-            'bayes_orphan_{}',
-            'probability_cloud_dual_{}']
-        excluded = [e.format(view) for e in excluded]
-        flags = xr.open_dataset(flags_path, decode_times=False,
-                                drop_variables=excluded, engine='h5netcdf')
-
-        confidence_var = 'confidence_{}'.format(view)
-        flag_masks = flags[confidence_var].attrs['flag_masks']
-        flag_meanings = flags[confidence_var].attrs['flag_meanings'].split()
-        flag_map = dict(zip(flag_meanings, flag_masks))
-        expanded_flags = {}
-        for key, bit in flag_map.items():
-            msk = flags[confidence_var] & bit
-            msk = xr.where(msk > 0, 1, 0)
-            expanded_flags[key] = msk
-        flags = flags.assign(**expanded_flags)
-        return flags
-
-    def load_geometry(self):
-        path = os.path.join(self.path, 'geometry_tn.nc')
-        geo = xr.open_dataset(path, decode_times=False, engine='h5netcdf')
-        return geo
-
-    def load_met(self):
-        met_path = os.path.join(self.path, 'met_tx.nc')
-        met = xr.open_dataset(met_path, decode_times=False, engine='h5netcdf')
-        met = met[['total_column_water_vapour_tx', 'cloud_fraction_tx',
-                   'skin_temperature_tx', 'sea_surface_temperature_tx',
-                   'total_column_ozone_tx', 'soil_wetness_tx',
-                   'snow_albedo_tx', 'snow_depth_tx', 'sea_ice_fraction_tx',
-                   'surface_pressure_tx']]
-        met = met.squeeze()
-        return met
-
-    def load_geodetic(self, view='an'):
-        flags_path = os.path.join(self.path, 'geodetic_{}.nc'.format(view))
-        excluded = ['elevation_orphan_an', 'elevation_an',
-                    'latitude_orphan_an', 'longitude_orphan_an']
-        flags = xr.open_dataset(flags_path, decode_times=False,
-                                drop_variables=excluded, engine='h5netcdf')
-        return flags
-
-
-class ProductImage:
-    def __init__(self, product):
-        self._loader = ImageLoader(product)
-        self._bts = None
-        self._rads = None
-
-    @property
-    def bts(self):
-        if self._bts is None:
-            self._bts = self._loader.load_bts()
-        return self._bts
-
-    @property
-    def rads(self):
-        if self._rads is None:
-            self._rads = self._loader.load_radiances()
-        return self._rads
-
-class ImagePlotter:
-
-    def __init__(self, image):
-        if isinstance(image, str):
-            self._image = ProductImage(image)
-        else:
-            self._image = image
-
-    def plot_bt_channels(self, **kwargs):
-        fig, axes = plt.subplots(1, 3)
-        axes = axes.flatten()
-        for ax, name in zip(axes, self._image.bts):
-            ax.matshow(self._image.bts[name], **kwargs)
-
-    def plot_rad_channels(self, **kwargs):
-        fig, axes = plt.subplots(2, 3)
-        axes = axes.flatten()
-        for ax, name in zip(axes, self._image.rads):
-            ax.matshow(self._image.rads[name], **kwargs)
-
-
-def central_crop(img, percent):
-    h, w = img.shape[:2]
-    dx = int(h * (1 - percent)) // 2
-    dy = int(w * (1 - percent)) // 2
-    return img[dx:-dx, dy:-dy]
-
-
-def central_crop_batch(img, input_size, output_size):
-    dh, dw = (input_size - output_size) // 2, (input_size - output_size) // 2
-    return img[:, dh:-dh, dw:-dw]
-
-
-def resize(img, shape, mode='L'):
-    """Resize an image to the desired size
-
-    This will use the PIL library to quickly resize the image to the new shape.
-    The interpolation method used is Lanczos.
-
-    Args:
-        img (np.array): the image to resize
-        shape (tuple): shape to resize the image to. Should contain two
-            elements (height, width).
-
-    Returns:
-        np.array: an array with the same size as `shape`.
-    """
-    img = Image.fromarray(img, mode=mode)
-    img = img.resize(reversed(shape), resample=Image.LANCZOS)
-    img = np.array(img)
-    return img
-
-
-def resize_spatial(data, h, w, mode='F'):
-
-    def downsample(img):
-        if img.dtype == np.float32:
-            mode = 'F'
-        if img.dtype == np.uint8:
-            mode = 'L'
-        if img.dtype == np.int32:
-            mode = 'I'
-
-        img = resize(img, (h, w), mode=mode)
-
-        return img
-
-    channels = {}
-    for channel_name in data:
-        channel = data[channel_name]
-        attrs = channel.attrs.copy()
-
-        if channel.dtype == np.float64:
-            channel = channel.astype(np.float32)
-
-        if channel.dtype == np.uint16:
-            channel = channel.astype(np.int32)
-
-        channels[channel_name] = xr.apply_ufunc(downsample, channel,
-                                                dask='parallelized',
-                                                input_core_dims=[
-                                                    ['rows', 'columns']],
-                                                output_core_dims=[
-                                                    ['rows', 'columns']],
-                                                output_dtypes=[channel.dtype],
-                                                output_sizes={
-                                                    'columns': w, 'rows': h},
-                                                exclude_dims=set(
-                                                    ['rows', 'columns']),
-                                                keep_attrs=True)
-
-        channels[channel_name] = channels[channel_name].assign_attrs(**attrs)
-
-    out = xr.Dataset(channels)
-    return out
-
